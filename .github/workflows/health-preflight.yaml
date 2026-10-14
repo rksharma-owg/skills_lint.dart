@@ -1,0 +1,39 @@
+name: Contribution health preflight
+on:
+  workflow_dispatch:
+    inputs:
+      test_sha:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.test_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify target and set baseline for local health mode
+        env:
+          TEST_SHA: ${{ inputs.test_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          git branch main "$BASE_SHA"
+          git symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA"
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: stable
+      - run: dart pub get
+      - name: Install the same health tool as the upstream reusable workflow
+        run: dart pub global activate --source git https://github.com/dart-lang/ecosystem --git-path pkgs/firehose/
+      - name: Run available file and package checks without posting
+        run: dart pub global run firehose:health --check changelog,breaking,do-not-submit,unused-dependencies --fail_on changelog,do-not-submit --warn_on breaking,unused-dependencies --comment health-report.md
