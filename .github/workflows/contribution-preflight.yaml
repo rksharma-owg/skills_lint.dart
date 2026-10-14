@@ -219,7 +219,7 @@ jobs:
           test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
           echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
           git show --no-patch --format=fuller HEAD
-      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
         with:
           sdk: stable
       - run: dart pub get
@@ -428,4 +428,3 @@ jobs:
       - name: Analyze with the lowest allowed dependency versions
         if: matrix.lower_bound
         run: dart analyze --fatal-infos
-
