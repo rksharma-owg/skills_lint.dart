@@ -1,0 +1,431 @@
+name: Contribution preflight
+on:
+  workflow_dispatch:
+    inputs:
+      test_sha:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+permissions:
+  contents: read
+defaults:
+  run:
+    working-directory: packages/skills_lint
+    shell: bash
+jobs:
+  analyze_and_test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        sdk: [stable]
+        include:
+          # Lowest SDK and dependency versions the pubspecs allow. Ubuntu
+          # only. repo_test/sdk_lower_bound_test.dart checks `sdk`.
+          - os: ubuntu-latest
+            sdk: 3.12.0
+            lower_bound: true
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.test_sha }}
+          fetch-depth: 0
+      - name: Verify contribution and merge baseline
+        working-directory: .
+        shell: bash
+        env:
+          TEST_SHA: ${{ inputs.test_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
+          git show --no-patch --format=fuller HEAD
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: ${{ matrix.sdk }}
+
+      - run: dart pub get
+
+      - run: dart analyze --fatal-infos
+
+      - name: Run cognitive complexity check
+        run: dart run cognitive_complexity --fail-threshold 20 --exclude 'third_party/**' --exclude 'packages/skills_lint/evals/test_data/**' --exclude '.worktrees/**' --exclude '.claude/**' .
+        working-directory: .
+
+      # One step per test directory, so a failure names its kind. See "Where
+      # tests go" in CONTRIBUTING.md. Plain `dart test` runs test/ only. Each
+      # later test step also runs when an earlier test step fails, so one run
+      # reports every kind of failure.
+      - name: Run tests
+        id: product_tests
+        run: dart test
+
+      - name: Run repo tests
+        id: repo_tests
+        if: success() || steps.product_tests.conclusion == 'failure'
+        run: dart test repo_test
+
+      # Compiles the CLI the way a release does and runs the CLI tests from
+      # test/ against the binary.
+      - name: Run compiled CLI tests
+        if: success() || steps.product_tests.conclusion == 'failure' || steps.repo_tests.conclusion == 'failure'
+        run: dart test compiled_test
+
+      - name: Verify example
+        run: dart run example/main.dart
+
+      - name: Verify API boundary runner
+        run: dart run example/api_boundary_runner/bin/main.dart
+
+      # `lower_bound` is set only by the lower-bound `include` entry above.
+      # After the downgrade, analysis checks that the declared dependency
+      # floors cover the APIs we use. Tests would mostly exercise old dev
+      # tooling, so they don't run.
+      - name: Resolve the lowest allowed dependency versions
+        if: matrix.lower_bound
+        run: dart pub downgrade
+
+      - name: Analyze with the lowest allowed dependency versions
+        if: matrix.lower_bound
+        run: dart analyze --fatal-infos
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.test_sha }}
+          fetch-depth: 0
+      - name: Verify contribution and merge baseline
+        working-directory: .
+        shell: bash
+        env:
+          TEST_SHA: ${{ inputs.test_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
+          git show --no-patch --format=fuller HEAD
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: stable
+
+      - run: dart pub get
+
+      - name: Collect coverage
+        run: dart test --coverage=coverage
+
+      - name: Format coverage to LCOV
+        run: dart run coverage:format_coverage --lcov --in=coverage --out=coverage/lcov.info --report-on=lib
+
+      # Action steps do not inherit defaults.run.working-directory, so this
+      # path is relative to the repository root.
+      - name: Enforce coverage threshold
+        uses: VeryGoodOpenSource/very_good_coverage@c953fca3e24a915e111cc6f55f03f756dcb3964c # v3 # zizmor: ignore[archived-uses]
+        with:
+          path: packages/skills_lint/coverage/lcov.info
+          min_coverage: 73
+          exclude: '**/*.g.dart'
+
+  formatting:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.test_sha }}
+          fetch-depth: 0
+      - name: Verify contribution and merge baseline
+        working-directory: .
+        shell: bash
+        env:
+          TEST_SHA: ${{ inputs.test_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
+          git show --no-patch --format=fuller HEAD
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: stable
+
+      - run: dart pub get
+
+      - run: dart format --output=none --set-exit-if-changed .
+
+  pana_score:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.test_sha }}
+          fetch-depth: 0
+      - name: Verify contribution and merge baseline
+        working-directory: .
+        shell: bash
+        env:
+          TEST_SHA: ${{ inputs.test_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
+          git show --no-patch --format=fuller HEAD
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: stable
+
+      - run: dart pub get
+
+      - name: Install pana
+        run: dart pub global activate pana
+
+      # pana --exit-code-threshold N fails the step when
+      # (max - granted) > N. Threshold 0 means any point drop fails;
+      # current package score is 160/160 and we want to keep it there.
+      - name: Pana score gate (160/160 required)
+        run: dart pub global run pana --no-warning --exit-code-threshold 0 .
+
+  sarif:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.test_sha }}
+          fetch-depth: 0
+      - name: Verify contribution and merge baseline
+        working-directory: .
+        shell: bash
+        env:
+          TEST_SHA: ${{ inputs.test_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
+          git show --no-patch --format=fuller HEAD
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d
+        with:
+          sdk: stable
+      - run: dart pub get
+      - name: Generate SARIF and enforce lint exit status
+        working-directory: .
+        run: dart run packages/skills_lint/bin/skills_lint.dart --format=sarif > skills-lint.sarif
+
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.test_sha }}
+          fetch-depth: 0
+      - name: Verify contribution and merge baseline
+        working-directory: .
+        shell: bash
+        env:
+          TEST_SHA: ${{ inputs.test_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
+          git show --no-patch --format=fuller HEAD
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: stable
+
+      - run: dart pub get
+
+      # On a pull request the checkout is the merge commit, whose first
+      # parent is the tip of the base branch. On a push it is the pushed
+      # commit, whose first parent is the previous tip of main.
+      - name: Check out the baseline
+        id: baseline
+        env:
+          BASELINE: ${{ inputs.base_sha }}
+        run: |
+          sha="$(git rev-parse --verify "${BASELINE:-HEAD^1}^{commit}")"
+          echo "BASELINE_SHA=$sha" >> "$GITHUB_ENV"
+          git worktree add --detach "$RUNNER_TEMP/baseline" "$sha"
+          cd "$RUNNER_TEMP/baseline/packages/skills_lint"
+          dart pub get
+
+      - name: Run benchmarks
+        id: benchmarks
+        run: >-
+          dart run benchmark/run_benchmarks.dart
+          --baseline "$RUNNER_TEMP/baseline/packages/skills_lint"
+          --json "$RUNNER_TEMP/benchmarks.json"
+          --markdown "$RUNNER_TEMP/benchmarks.md"
+
+      # The rule timings run in process, so the baseline timings build this
+      # checkout's timing script against the baseline's code. That build can
+      # fail because the library API changed since the baseline, not because
+      # of a defect, so this step does not fail the job. Without baseline
+      # timings the report shows the candidate alone.
+      - name: Time each rule on the baseline
+        id: baseline_timings
+        continue-on-error: true
+        run: |
+          baseline="$RUNNER_TEMP/baseline/packages/skills_lint"
+          rm -rf "$baseline/benchmark"
+          cp -R benchmark "$baseline/benchmark"
+          cd "$baseline"
+          dart compile exe --verbosity=error benchmark/rule_timings.dart -o "$RUNNER_TEMP/rule_timings_baseline"
+          "$RUNNER_TEMP/rule_timings_baseline" --repo-root "$GITHUB_WORKSPACE" --json "$RUNNER_TEMP/rule_timings_baseline.json" > /dev/null
+
+      - name: Time each rule
+        id: timings
+        run: |
+          baseline_args=()
+          if [ -f "$RUNNER_TEMP/rule_timings_baseline.json" ]; then
+            baseline_args=(--baseline-json "$RUNNER_TEMP/rule_timings_baseline.json")
+          fi
+          dart compile exe --verbosity=error benchmark/rule_timings.dart -o "$RUNNER_TEMP/rule_timings"
+          "$RUNNER_TEMP/rule_timings" --repo-root "$GITHUB_WORKSPACE" "${baseline_args[@]}" \
+            --json "$RUNNER_TEMP/rule_timings.json" --markdown "$RUNNER_TEMP/rule_timings.md"
+
+      # Runs after a failed step to explain it, but not after a cancel.
+      - name: Write the job summary
+        if: ${{ !cancelled() }}
+        env:
+          BASELINE_OUTCOME: ${{ steps.baseline.outcome }}
+          BENCHMARKS_OUTCOME: ${{ steps.benchmarks.outcome }}
+          BASELINE_TIMINGS_OUTCOME: ${{ steps.baseline_timings.outcome }}
+          TIMINGS_OUTCOME: ${{ steps.timings.outcome }}
+        run: |
+          {
+            echo "Baseline: \`${BASELINE_SHA:-none}\`. Candidate: \`$(git rev-parse HEAD)\`."
+            echo
+            if [ "$BASELINE_OUTCOME" = failure ]; then
+              echo "> [!CAUTION]"
+              echo "> Checking out or fetching dependencies for the baseline failed, so this job fails. See the \"Check out the baseline\" step log."
+              echo
+            fi
+            if [ "$BENCHMARKS_OUTCOME" = failure ]; then
+              echo "> [!CAUTION]"
+              echo "> The benchmark run failed: a build failed or the CLI exited with an unexpected code, so this job fails. See the \"Run benchmarks\" step log."
+              echo
+            fi
+            if [ "$BASELINE_TIMINGS_OUTCOME" = failure ]; then
+              echo "> [!NOTE]"
+              echo "> The rule timings on the baseline failed, so the rule timings show the candidate alone. This does not fail the job. See the \"Time each rule on the baseline\" step log."
+              echo
+            fi
+            if [ "$TIMINGS_OUTCOME" = failure ]; then
+              echo "> [!CAUTION]"
+              echo "> The rule timings failed, so this job fails. See the \"Time each rule\" step log."
+              echo
+            fi
+            if [ -f "$RUNNER_TEMP/benchmarks.md" ]; then
+              cat "$RUNNER_TEMP/benchmarks.md"
+            fi
+            if [ -f "$RUNNER_TEMP/rule_timings.md" ]; then
+              echo
+              cat "$RUNNER_TEMP/rule_timings.md"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmarks
+          path: |
+            ${{ runner.temp }}/benchmarks.json
+            ${{ runner.temp }}/benchmarks.md
+            ${{ runner.temp }}/rule_timings.json
+            ${{ runner.temp }}/rule_timings.md
+            ${{ runner.temp }}/rule_timings_baseline.json
+
+  baseline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        sdk: [stable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.base_sha }}
+          fetch-depth: 0
+      - name: Verify contribution and merge baseline
+        working-directory: .
+        shell: bash
+        env:
+          TEST_SHA: ${{ inputs.base_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TEST_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" HEAD
+          test "$(git merge-tree --write-tree "$BASE_SHA" HEAD)" = "$(git rev-parse HEAD^{tree})"
+          echo "Tested contribution: $TEST_SHA; baseline: $BASE_SHA; merge tree equals contribution tree."
+          git show --no-patch --format=fuller HEAD
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        with:
+          sdk: ${{ matrix.sdk }}
+
+      - run: dart pub get
+
+      - run: dart analyze --fatal-infos
+
+      - name: Run cognitive complexity check
+        run: dart run cognitive_complexity --fail-threshold 20 --exclude 'third_party/**' --exclude 'packages/skills_lint/evals/test_data/**' --exclude '.worktrees/**' --exclude '.claude/**' .
+        working-directory: .
+
+      # One step per test directory, so a failure names its kind. See "Where
+      # tests go" in CONTRIBUTING.md. Plain `dart test` runs test/ only. Each
+      # later test step also runs when an earlier test step fails, so one run
+      # reports every kind of failure.
+      - name: Run tests
+        id: product_tests
+        run: dart test
+
+      - name: Run repo tests
+        id: repo_tests
+        if: success() || steps.product_tests.conclusion == 'failure'
+        run: dart test repo_test
+
+      # Compiles the CLI the way a release does and runs the CLI tests from
+      # test/ against the binary.
+      - name: Run compiled CLI tests
+        if: success() || steps.product_tests.conclusion == 'failure' || steps.repo_tests.conclusion == 'failure'
+        run: dart test compiled_test
+
+      - name: Verify example
+        run: dart run example/main.dart
+
+      - name: Verify API boundary runner
+        run: dart run example/api_boundary_runner/bin/main.dart
+
+      # `lower_bound` is set only by the lower-bound `include` entry above.
+      # After the downgrade, analysis checks that the declared dependency
+      # floors cover the APIs we use. Tests would mostly exercise old dev
+      # tooling, so they don't run.
+      - name: Resolve the lowest allowed dependency versions
+        if: matrix.lower_bound
+        run: dart pub downgrade
+
+      - name: Analyze with the lowest allowed dependency versions
+        if: matrix.lower_bound
+        run: dart analyze --fatal-infos
+
